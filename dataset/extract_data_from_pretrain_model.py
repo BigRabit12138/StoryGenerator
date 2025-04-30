@@ -1,12 +1,14 @@
 '''
 从预训练权重中提取训练数据
 '''
+import os
 import json
 import shutil
 import signal
 
 import torch
 import asyncio
+
 from pathlib import Path
 from typing import Dict, List
 from dataclasses import dataclass, field
@@ -15,7 +17,7 @@ from transformers import AutoConfig
 from huggingface_hub import snapshot_download
 
 # ===== 配置常量 =====
-DATA_PATH = Path("G:\ML_DATA\PretrainData")  # 总数据存储根目录
+DATA_PATH = Path("/home/wuzhenglin/PretrainData")  # 总数据存储根目录
 MODEL_PATHS_FILE = Path(__file__).parent / "model_path.txt"  # 模型列表文件
 STATUS_FILE = Path(__file__).parent / "status.json"  # 状态记录文件
 SAFE_SHUTDOWN_FILE = Path(__file__).parent / "shutdown.lock"  # 安全关闭锁文件
@@ -51,11 +53,12 @@ def get_model_dir(model_name: str) -> Path:
 async def download_model(model_name: str):
     model_dir = get_model_dir(model_name)
     try:
-        snapshot_download(
+        await asyncio.to_thread(
+            snapshot_download,
             repo_id=model_name,
             local_dir=model_dir,
-            resume_download=True
         )
+
     except Exception as e:
         print(f"{model_name} 下载出现错误！\n{e}")
         return
@@ -73,9 +76,10 @@ async def download_model(model_name: str):
         "processed_params": list(),
         "processed_files": list(),
     }
+    print(f"完成下载模型: {model_name}")
 
 
-async def process_weights(model_name: str, weight_file: str):
+def process_weights(model_name: str, weight_file: str):
     model_dir = get_model_dir(model_name)
     file_path = model_dir / weight_file
     
@@ -222,7 +226,6 @@ async def download_worker():
         
         print(f"开始下载模型: {model_name}")
         await download_model(model_name)
-        print(f"完成下载模型: {model_name}")
 
 
 async def process_worker():
@@ -245,10 +248,14 @@ async def process_worker():
         model_dir = get_model_dir(model_name)
         print(f"开始处理模型: {model_name}")
         
-        # 串行处理每个权重文件
-        for wf in status.models[model_name]["weight_files"]:
-            if wf not in status.models[model_name]["processed_files"]:
-                await process_weights(model_name, wf)
+        # 并行处理每个未处理的权重文件
+        tasks = [
+            asyncio.to_thread(process_weights, model_name, wf)
+            for wf in status.models[model_name]["weight_files"]
+            if wf not in status.models[model_name]["processed_files"]
+        ]
+        await asyncio.gather(*tasks)
+
         
         # 标记为已处理
         status.models[model_name]["processed"] = True
@@ -283,7 +290,7 @@ def signal_handler(sig, frame):
     save_status()
     if Path(SAFE_SHUTDOWN_FILE).exists():
         Path(SAFE_SHUTDOWN_FILE).unlink()
-    exit(0)
+    os._exit(0)
 
 if __name__ == "__main__":
     # 初始化信号处理
