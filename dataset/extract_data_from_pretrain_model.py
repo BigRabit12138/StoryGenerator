@@ -5,19 +5,26 @@ import os
 import json
 import shutil
 import signal
+import threading
 
 import torch
 import asyncio
 
+from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, List
+from transformers import AutoConfig
 from dataclasses import dataclass, field
 from safetensors.torch import save_file, load_file
-from transformers import AutoConfig
 from huggingface_hub import snapshot_download
 
+import sys
+sys.path.append(str(Path(__file__).parent.parent.resolve()))
+from dataset.online_normalizer import OnlineNormalizer
+
+
 # ===== 配置常量 =====
-DATA_PATH = Path("/home/wuzhenglin/PretrainData")  # 总数据存储根目录
+DATA_PATH = Path("/root/autodl-tmp/PretrainData")  # 总数据存储根目录
 MODEL_PATHS_FILE = Path(__file__).parent / "model_path.txt"  # 模型列表文件
 STATUS_FILE = Path(__file__).parent / "status.json"  # 状态记录文件
 SAFE_SHUTDOWN_FILE = Path(__file__).parent / "shutdown.lock"  # 安全关闭锁文件
@@ -27,24 +34,57 @@ SAFE_SHUTDOWN_FILE = Path(__file__).parent / "shutdown.lock"  # 安全关闭锁�
 class ProcessingStatus:
     models: Dict[str, Dict] = field(default_factory=dict)  # 模型处理状态
     model_types: List[str] = field(default_factory=list)  # 模型类型列表
-    type_indices: Dict[str, int] = field(default_factory=dict)  # 类型名称到索引的映射
+    is_download_finish: bool = field(default=False) # 下载进程是否结束
+    max_dimension: int = field(default=0) # 所有矢量的最大维度
+    norms: list[OnlineNormalizer] = field(default_factory=list) # 标准化统计值
+    last_check_norms: list[dict] = field(default_factory=list)  # 上一次存储的状态
 
     @classmethod
     def from_dict(cls, data):
+        norms = []
+        for norm in data["norms"]:
+            norms.append(
+                OnlineNormalizer(
+                    norm['n'],
+                    norm['mean'],
+                    norm['m2'],
+                )
+            )
         return cls(
             models=data["models"],
             model_types=data["model_types"],
-            type_indices={k: v for k, v in enumerate(data["model_types"])}
+            is_download_finish=data['is_download_finish'],
+            max_dimension=data['max_dimension'],
+            norms=norms,
+            last_check_norms=data["norms"],
         )
 
-    def to_dict(self):
+    def to_dict(self, active=False):
+        if active:
+            norms = []
+            for norm in self.norms:
+                norms.append(
+                    {
+                        'n': norm.n,
+                        'mean': norm.mean.item(),
+                        'm2': norm.m2.item(),
+                        'std': norm.get_std().item(),
+                    }
+                )
+            self.last_check_norms = norms
+        else:
+            norms = status.last_check_norms
         return {
             "models": self.models,
             "model_types": self.model_types,
+            "is_download_finish": self.is_download_finish,
+            "max_dimension": self.max_dimension,
+            "norms": norms,
         }
 
 # ===== 全局状态和工具函数 =====
 status = ProcessingStatus()
+status_lock = threading.Lock()
 
 def get_model_dir(model_name: str) -> Path:
     org, name = model_name.split("/")
@@ -76,6 +116,7 @@ async def download_model(model_name: str):
         "processed_params": list(),
         "processed_files": list(),
     }
+    save_status()  # 保存状态
     print(f"完成下载模型: {model_name}")
 
 
@@ -85,11 +126,11 @@ def process_weights(model_name: str, weight_file: str):
     
     # 加载配置文件
     config = AutoConfig.from_pretrained(model_dir)
-    if config.model_type not in status.type_indices:
-        status.model_types.append(config.model_type)
-        status.type_indices[config.model_type] = len(status.model_types) - 1
-    
-    model_idx = status.type_indices[config.model_type]
+    with status_lock:
+        if config.model_type not in status.model_types:
+            status.model_types.append(config.model_type)
+        
+        model_idx = status.model_types.index(config.model_type)
     
     # 加载权重文件
     if file_path.suffix == ".safetensors":
@@ -102,10 +143,11 @@ def process_weights(model_name: str, weight_file: str):
     output_dir = DATA_PATH / "TrainData" / org / name
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    for param_name, tensor in state_dict.items():
+    for param_name, tensor in tqdm(state_dict.items()):
         param_name = param_name.lower()
-        if param_name in status.models[model_name]["processed_params"]:
-            continue
+        with status_lock:
+            if param_name in status.models[model_name]["processed_params"]:
+                continue
 
         # 生成标签
         embedds = ['embed', ]
@@ -193,21 +235,46 @@ def process_weights(model_name: str, weight_file: str):
         if any([True for bias in biases if bias in param_name]):
             weight_type = 0
             weight_idx = 0
+            with status_lock:
+                if tensor.shape[0] > status.max_dimension:
+                    status.max_dimension = tensor.shape[0]
+                for idx, one_item in enumerate(tensor):
+                    if idx >= len(status.norms):
+                        status.norms.append(OnlineNormalizer())
+                    status.norms[idx].update(one_item)
             save_data(tensor)
         elif len(tensor.shape) == 1:
             weight_type = 1 / 2
             weight_idx = 0
+            with status_lock:
+                if tensor.shape[0] > status.max_dimension:
+                    status.max_dimension = tensor.shape[0]
+                for idx, one_item in enumerate(tensor):
+                    if idx >= len(status.norms):
+                        status.norms.append(OnlineNormalizer())
+                    status.norms[idx].update(one_item)
             save_data(tensor)
         else:
+            with status_lock:
+                if tensor.shape[-1] > status.max_dimension:
+                    status.max_dimension = tensor.shape[-1]
+                for idx, one_item in enumerate(tensor.T):
+                    if idx >= len(status.norms):
+                        status.norms.append(OnlineNormalizer())
+                    status.norms[idx].update(one_item)
             for weight_idx, vector in enumerate(tensor):
                 weight_type = 2 / 2
-                weight_idx = weight_idx / len(tensor)
+                weight_idx = weight_idx / (len(tensor) - 1)
                 save_data(vector)
                 
         # 更新处理状态
-        status.models[model_name]["processed_params"].append(param_name)
+        with status_lock:
+            status.models[model_name]["processed_params"].append(param_name)
+            save_status(active=True)  # 保存状态
     # 更新处理状态
-    status.models[model_name]["processed_files"].append(weight_file)
+    with status_lock:
+        status.models[model_name]["processed_files"].append(weight_file)
+        save_status(active=True)  # 保存状态
 
 
 async def download_worker():
@@ -226,49 +293,51 @@ async def download_worker():
         
         print(f"开始下载模型: {model_name}")
         await download_model(model_name)
+    status.is_download_finish = True
 
-
-async def process_worker():
-    """负责处理权重的异步任务"""
-    with open(MODEL_PATHS_FILE) as f:
-        models = [line.strip() for line in f if line.strip()]
-    
-    for model_name in models:
-        with open(MODEL_PATHS_FILE) as f:
-            for line in f:
-                if line.strip() not in models:
-                    models.append(line.strip())
-        # 检查是否已下载且未处理
-        if model_name not in status.models or not status.models[model_name]["downloaded"]:
-            continue
-        if status.models[model_name]["processed"]:
-            print(f"{model_name} 已经处理完毕！")
-            continue
-        
-        model_dir = get_model_dir(model_name)
-        print(f"开始处理模型: {model_name}")
-        
-        # 并行处理每个未处理的权重文件
-        tasks = [
-            asyncio.to_thread(process_weights, model_name, wf)
-            for wf in status.models[model_name]["weight_files"]
-            if wf not in status.models[model_name]["processed_files"]
+async def process_worker(poll_interval=5):
+    """持续检查 status.models 中的模型，处理已下载但未处理的模型"""
+    while True:
+        # 找出已下载但未处理的模型
+        pending_models = [
+            model_name for model_name, info in status.models.items()
+            if info.get("downloaded") and not info.get("processed")
         ]
-        await asyncio.gather(*tasks)
 
-        
-        # 标记为已处理
-        status.models[model_name]["processed"] = True
-        save_status()  # 及时保存状态
-        
-        # 清理目录
-        try:
-            shutil.rmtree(model_dir)
-            print(f"已清理模型目录: {model_dir}")
-        except Exception as e:
-            print(f"清理目录失败: {str(e)}")
-        
-        print(f"完成处理模型: {model_name}")
+        is_finish = [info.get("processed") for info in status.models.values()]
+
+        if status.is_download_finish and all(is_finish):
+            print("✅ 所有模型均已处理，退出任务。")
+            break  # 所有模型都处理完了，结束任务
+
+        for model_name in pending_models:
+            model_dir = get_model_dir(model_name)
+            print(f"开始处理模型: {model_name}")
+            
+            # 并行处理未处理的权重文件
+            tasks = [
+                asyncio.to_thread(process_weights, model_name, wf)
+                for wf in status.models[model_name]["weight_files"]
+                if wf not in status.models[model_name]["processed_files"]
+            ]
+            await asyncio.gather(*tasks)
+
+            # 更新状态
+            status.models[model_name]["processed"] = True
+            save_status(active=True)  # 保存状态
+
+            # 清理模型目录
+            try:
+                shutil.rmtree(model_dir)
+                print(f"已清理模型目录: {model_dir}")
+            except Exception as e:
+                print(f"清理目录失败: {str(e)}")
+            
+            print(f"✅ 完成处理模型: {model_name}")
+
+        # 等待一会再检查是否有新模型添加
+        await asyncio.sleep(poll_interval)
+
 
 async def main_processing():
     """主处理函数，并行运行下载和处理任务"""
@@ -281,9 +350,9 @@ async def main_processing():
 
 
 # ===== 信号处理和状态保存 =====
-def save_status():
+def save_status(active=False):
     with open(STATUS_FILE, "w") as f:
-        json.dump(status.to_dict(), f)
+        json.dump(status.to_dict(active), f)
 
 def signal_handler(sig, frame):
     print("\n捕获中断信号，保存状态...")

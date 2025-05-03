@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+test.py
+./dataset/train.txt
+./dataset/val.txt
+./dataset/test.txt
